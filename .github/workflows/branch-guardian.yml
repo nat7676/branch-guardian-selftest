@@ -50,9 +50,12 @@ jobs:
           git config "http.https://github.com/.extraheader" "AUTHORIZATION: basic ${authb64}"
           git remote add origin "https://github.com/${REPO}.git"
 
-          # --- authoritative current SHAs (branches are advertised, so ls-remote is reliable) ---
-          tip="$(git ls-remote origin "refs/heads/${BRANCH}"       | awk 'NR==1{print $1}')"
-          ckpt="$(git ls-remote origin "refs/heads/${ckpt_branch}" | awk 'NR==1{print $1}')"
+          # --- authoritative current SHAs. A FAILED lookup must SPARE, not read as deleted. ---
+          if ! ls_out="$(git ls-remote origin "refs/heads/${BRANCH}" "refs/heads/${ckpt_branch}" 2>/dev/null)"; then
+            echo "ls-remote failed; sparing ${BRANCH}"; exit 0
+          fi
+          tip="$(printf '%s\n' "${ls_out}" | awk -v r="refs/heads/${BRANCH}" '$2==r{print $1}')"
+          ckpt="$(printf '%s\n' "${ls_out}" | awk -v r="refs/heads/${ckpt_branch}" '$2==r{print $1}')"
 
           # --- pause window? ---
           paused=false
@@ -78,7 +81,7 @@ jobs:
               printf '%s\n' "    scripts/guardian-resume.sh ${REPO}"
             } > ../issue.md
             existing="$(gh issue list --repo "${REPO}" --state open --json number,title \
-              --jq '.[] | select(.title | contains("Branch Guardian")) | .number' 2>/dev/null | head -1 || true)"
+              --jq ".[] | select(.title | contains(\"Branch Guardian: ${BRANCH} \")) | .number" 2>/dev/null | head -1 || true)"
             if [ -n "${existing}" ]; then
               gh issue comment "${existing}" --repo "${REPO}" --body-file ../issue.md >/dev/null
               echo "alert: commented on issue #${existing}"
@@ -92,7 +95,8 @@ jobs:
           if [ -z "${tip}" ]; then
             if [ "${paused}" = true ]; then echo "paused: deletion of ${BRANCH} allowed"; exit 0; fi
             if [ -z "${ckpt}" ]; then echo "no checkpoint for ${BRANCH}; nothing to restore"; exit 0; fi
-            git fetch -q --no-tags origin "+refs/heads/${ckpt_branch}:refs/g/ckpt"
+            git fetch -q --no-tags origin "+refs/heads/${ckpt_branch}:refs/g/ckpt" || { echo "ckpt fetch failed; sparing"; exit 0; }
+            git rev-parse --verify -q refs/g/ckpt >/dev/null || { echo "ckpt missing; sparing"; exit 0; }
             git push origin "refs/g/ckpt:refs/heads/${BRANCH}"
             echo "RESTORED deleted branch ${BRANCH} -> ${ckpt}"
             alert "deletion" "${ckpt}" "(deleted)"
@@ -101,27 +105,36 @@ jobs:
 
           # --- CASE: first ever push -> baseline ---
           if [ -z "${ckpt}" ]; then
-            git fetch -q --no-tags origin "+refs/heads/${BRANCH}:refs/g/tip"
+            git fetch -q --no-tags origin "+refs/heads/${BRANCH}:refs/g/tip" || { echo "tip fetch failed; sparing"; exit 0; }
+            git rev-parse --verify -q refs/g/tip >/dev/null || { echo "tip missing; sparing"; exit 0; }
             git push origin "refs/g/tip:refs/heads/${ckpt_branch}"
-            echo "baselined checkpoint ${ckpt_branch} -> ${tip}"
+            echo "BASELINED checkpoint ${ckpt_branch} -> ${tip} (verify this is a good tip)"
             exit 0
           fi
 
-          # --- have both: fetch objects and test ancestry ---
+          # --- have both: fetch objects, verify resolved, then test ancestry by exit code ---
           git fetch -q --no-tags origin \
             "+refs/heads/${BRANCH}:refs/g/tip" \
-            "+refs/heads/${ckpt_branch}:refs/g/ckpt"
-
-          if git merge-base --is-ancestor refs/g/ckpt refs/g/tip; then
-            # fast-forward: ratchet the checkpoint up
-            if [ "${ckpt}" != "${tip}" ]; then
-              git push origin "refs/g/tip:refs/heads/${ckpt_branch}"
-              echo "advanced checkpoint ${ckpt} -> ${tip}"
-            else
-              echo "checkpoint already at tip ${tip}"
-            fi
-            exit 0
+            "+refs/heads/${ckpt_branch}:refs/g/ckpt" || { echo "fetch failed; sparing"; exit 0; }
+          if ! git rev-parse --verify -q refs/g/tip >/dev/null || ! git rev-parse --verify -q refs/g/ckpt >/dev/null; then
+            echo "fetched refs incomplete; sparing"; exit 0
           fi
+
+          # 0=ancestor(advance), 1=not(rollback), anything else=error(spare).
+          git merge-base --is-ancestor refs/g/ckpt refs/g/tip; rc=$?
+          case "${rc}" in
+            0)
+              if [ "${ckpt}" != "${tip}" ]; then
+                git push origin "refs/g/tip:refs/heads/${ckpt_branch}"
+                echo "advanced checkpoint ${ckpt} -> ${tip}"
+              else
+                echo "checkpoint already at tip ${tip}"
+              fi
+              exit 0
+              ;;
+            1) ;;  # not an ancestor -> rewind handling below
+            *) echo "merge-base error (rc=${rc}); sparing"; exit 0 ;;
+          esac
 
           # --- non-fast-forward: rewind / rewrite ---
           if [ "${paused}" = true ]; then
