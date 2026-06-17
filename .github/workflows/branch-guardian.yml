@@ -121,7 +121,8 @@ jobs:
           fi
 
           # 0=ancestor(advance), 1=not(rollback), anything else=error(spare).
-          git merge-base --is-ancestor refs/g/ckpt refs/g/tip; rc=$?
+          # set-e-safe capture: a bare failing command would abort the job under `set -e`.
+          rc=0; git merge-base --is-ancestor refs/g/ckpt refs/g/tip || rc=$?
           case "${rc}" in
             0)
               if [ "${ckpt}" != "${tip}" ]; then
