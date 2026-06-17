@@ -1,0 +1,136 @@
+name: branch-guardian
+
+# Forward-only checkpoint ratchet, enforced server-side.
+# For each protected branch, keep a checkpoint branch `guardian/checkpoint/<branch>`
+# that only ever moves forward. On every push:
+#   - first push            -> baseline the checkpoint
+#   - fast-forward           -> advance the checkpoint
+#   - rewind/rewrite/delete  -> restore the branch to the checkpoint + open an alert issue
+# A timed pause window (repo variable GUARDIAN_PAUSE_UNTIL) is the deliberate bypass for
+# intentional rewrites: while open, the guardian re-baselines instead of rolling back.
+
+on:
+  push:
+    branches:
+      - main
+      - master
+      - dev
+
+permissions:
+  contents: write
+  issues: write
+
+# Serialize concurrent pushes to the same ref so two runs can't race on the checkpoint.
+concurrency:
+  group: branch-guardian-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  guardian:
+    # Never act on the guardian's own checkpoint branches (defensive; they don't match the
+    # trigger filter, but this makes the intent explicit).
+    if: ${{ !startsWith(github.ref_name, 'guardian/') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enforce checkpoint ratchet
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.ref_name }}
+          PAUSE_UNTIL: ${{ vars.GUARDIAN_PAUSE_UNTIL }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          ckpt_branch="guardian/checkpoint/${BRANCH}"
+
+          # --- auth (token via http header, never in a URL or on stdout) ---
+          authb64="$(printf 'x-access-token:%s' "${GH_TOKEN}" | base64 | tr -d '\n')"
+          git init -q gw && cd gw
+          git config "http.https://github.com/.extraheader" "AUTHORIZATION: basic ${authb64}"
+          git remote add origin "https://github.com/${REPO}.git"
+
+          # --- authoritative current SHAs (branches are advertised, so ls-remote is reliable) ---
+          tip="$(git ls-remote origin "refs/heads/${BRANCH}"       | awk 'NR==1{print $1}')"
+          ckpt="$(git ls-remote origin "refs/heads/${ckpt_branch}" | awk 'NR==1{print $1}')"
+
+          # --- pause window? ---
+          paused=false
+          if [ -n "${PAUSE_UNTIL:-}" ]; then
+            now="$(date -u +%s)"
+            until="$(date -u -d "${PAUSE_UNTIL}" +%s 2>/dev/null || echo 0)"
+            if [ "${now}" -lt "${until}" ]; then paused=true; fi
+            echo "pause window: until=${PAUSE_UNTIL} active=${paused}"
+          fi
+
+          alert() {
+            kind="$1"; restored="$2"; rejected="$3"
+            title="🛡️ Branch Guardian: ${BRANCH} ${kind} was rolled back"
+            {
+              printf '%s\n\n' "The \`${BRANCH}\` branch received a non-fast-forward update (${kind}) and was automatically restored by Branch Guardian."
+              printf '%s\n' "- Restored to (checkpoint): ${restored}"
+              printf '%s\n' "- Rejected tip: ${rejected}"
+              printf '%s\n\n' "- Run: ${RUN_URL}"
+              printf '%s\n' "If this rewrite was intentional, pause the guardian and redo it:"
+              printf '\n'
+              printf '%s\n' "    scripts/guardian-pause.sh ${REPO} 30"
+              printf '%s\n' "    git push --force origin ${BRANCH}"
+              printf '%s\n' "    scripts/guardian-resume.sh ${REPO}"
+            } > ../issue.md
+            existing="$(gh issue list --repo "${REPO}" --state open --json number,title \
+              --jq '.[] | select(.title | contains("Branch Guardian")) | .number' 2>/dev/null | head -1 || true)"
+            if [ -n "${existing}" ]; then
+              gh issue comment "${existing}" --repo "${REPO}" --body-file ../issue.md >/dev/null
+              echo "alert: commented on issue #${existing}"
+            else
+              gh issue create --repo "${REPO}" --title "${title}" --body-file ../issue.md >/dev/null
+              echo "alert: opened new issue"
+            fi
+          }
+
+          # --- CASE: branch deleted ---
+          if [ -z "${tip}" ]; then
+            if [ "${paused}" = true ]; then echo "paused: deletion of ${BRANCH} allowed"; exit 0; fi
+            if [ -z "${ckpt}" ]; then echo "no checkpoint for ${BRANCH}; nothing to restore"; exit 0; fi
+            git fetch -q --no-tags origin "+refs/heads/${ckpt_branch}:refs/heads/${ckpt_branch}"
+            git push origin "refs/heads/${ckpt_branch}:refs/heads/${BRANCH}"
+            echo "RESTORED deleted branch ${BRANCH} -> ${ckpt}"
+            alert "deletion" "${ckpt}" "(deleted)"
+            exit 0
+          fi
+
+          # --- CASE: first ever push -> baseline ---
+          if [ -z "${ckpt}" ]; then
+            git fetch -q --no-tags origin "+refs/heads/${BRANCH}:refs/heads/${BRANCH}"
+            git push origin "refs/heads/${BRANCH}:refs/heads/${ckpt_branch}"
+            echo "baselined checkpoint ${ckpt_branch} -> ${tip}"
+            exit 0
+          fi
+
+          # --- have both: fetch objects and test ancestry ---
+          git fetch -q --no-tags origin \
+            "+refs/heads/${BRANCH}:refs/heads/${BRANCH}" \
+            "+refs/heads/${ckpt_branch}:refs/heads/${ckpt_branch}"
+
+          if git merge-base --is-ancestor "${ckpt}" "${tip}"; then
+            # fast-forward: ratchet the checkpoint up
+            if [ "${ckpt}" != "${tip}" ]; then
+              git push origin "${tip}:refs/heads/${ckpt_branch}"
+              echo "advanced checkpoint ${ckpt} -> ${tip}"
+            else
+              echo "checkpoint already at tip ${tip}"
+            fi
+            exit 0
+          fi
+
+          # --- non-fast-forward: rewind / rewrite ---
+          if [ "${paused}" = true ]; then
+            git push -f origin "${tip}:refs/heads/${ckpt_branch}"
+            echo "paused: re-baselined checkpoint -> ${tip} (intentional rewrite accepted)"
+            exit 0
+          fi
+
+          git push -f origin "${ckpt}:refs/heads/${BRANCH}"
+          echo "ROLLED BACK ${BRANCH}: ${tip} -> ${ckpt}"
+          alert "rewind/rewrite" "${ckpt}" "${tip}"
+          exit 0
