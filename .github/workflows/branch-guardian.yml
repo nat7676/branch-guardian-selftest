@@ -92,8 +92,8 @@ jobs:
           if [ -z "${tip}" ]; then
             if [ "${paused}" = true ]; then echo "paused: deletion of ${BRANCH} allowed"; exit 0; fi
             if [ -z "${ckpt}" ]; then echo "no checkpoint for ${BRANCH}; nothing to restore"; exit 0; fi
-            git fetch -q --no-tags origin "+refs/heads/${ckpt_branch}:refs/heads/${ckpt_branch}"
-            git push origin "refs/heads/${ckpt_branch}:refs/heads/${BRANCH}"
+            git fetch -q --no-tags origin "+refs/heads/${ckpt_branch}:refs/g/ckpt"
+            git push origin "refs/g/ckpt:refs/heads/${BRANCH}"
             echo "RESTORED deleted branch ${BRANCH} -> ${ckpt}"
             alert "deletion" "${ckpt}" "(deleted)"
             exit 0
@@ -101,21 +101,21 @@ jobs:
 
           # --- CASE: first ever push -> baseline ---
           if [ -z "${ckpt}" ]; then
-            git fetch -q --no-tags origin "+refs/heads/${BRANCH}:refs/heads/${BRANCH}"
-            git push origin "refs/heads/${BRANCH}:refs/heads/${ckpt_branch}"
+            git fetch -q --no-tags origin "+refs/heads/${BRANCH}:refs/g/tip"
+            git push origin "refs/g/tip:refs/heads/${ckpt_branch}"
             echo "baselined checkpoint ${ckpt_branch} -> ${tip}"
             exit 0
           fi
 
           # --- have both: fetch objects and test ancestry ---
           git fetch -q --no-tags origin \
-            "+refs/heads/${BRANCH}:refs/heads/${BRANCH}" \
-            "+refs/heads/${ckpt_branch}:refs/heads/${ckpt_branch}"
+            "+refs/heads/${BRANCH}:refs/g/tip" \
+            "+refs/heads/${ckpt_branch}:refs/g/ckpt"
 
-          if git merge-base --is-ancestor "${ckpt}" "${tip}"; then
+          if git merge-base --is-ancestor refs/g/ckpt refs/g/tip; then
             # fast-forward: ratchet the checkpoint up
             if [ "${ckpt}" != "${tip}" ]; then
-              git push origin "${tip}:refs/heads/${ckpt_branch}"
+              git push origin "refs/g/tip:refs/heads/${ckpt_branch}"
               echo "advanced checkpoint ${ckpt} -> ${tip}"
             else
               echo "checkpoint already at tip ${tip}"
@@ -125,12 +125,12 @@ jobs:
 
           # --- non-fast-forward: rewind / rewrite ---
           if [ "${paused}" = true ]; then
-            git push -f origin "${tip}:refs/heads/${ckpt_branch}"
+            git push -f origin "refs/g/tip:refs/heads/${ckpt_branch}"
             echo "paused: re-baselined checkpoint -> ${tip} (intentional rewrite accepted)"
             exit 0
           fi
 
-          git push -f origin "${ckpt}:refs/heads/${BRANCH}"
+          git push -f origin "refs/g/ckpt:refs/heads/${BRANCH}"
           echo "ROLLED BACK ${BRANCH}: ${tip} -> ${ckpt}"
           alert "rewind/rewrite" "${ckpt}" "${tip}"
           exit 0
