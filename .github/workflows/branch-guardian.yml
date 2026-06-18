@@ -27,9 +27,9 @@ concurrency:
 
 jobs:
   guardian:
-    # Never act on the guardian's own checkpoint branches (defensive; they don't match the
-    # trigger filter, but this makes the intent explicit).
-    if: ${{ !startsWith(github.ref_name, 'guardian/') }}
+    # Skip the guardian's own checkpoint branches, and honor the per-repo opt-out
+    # (set repo variable GUARDIAN_DISABLED=true to turn the guardian off for this repo).
+    if: ${{ !startsWith(github.ref_name, 'guardian/') && vars.GUARDIAN_DISABLED != 'true' }}
     runs-on: ubuntu-latest
     steps:
       - name: Enforce checkpoint ratchet
